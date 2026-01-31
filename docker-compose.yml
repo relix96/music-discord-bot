@@ -6,5 +6,4 @@ services:
     environment:
       - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
       - FFMPEG_PATH=/usr/bin/ffmpeg
-    volumes:
-      - .:/app
+    # No volume on /app – use files from the image so main.py is present
