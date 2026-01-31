@@ -1,0 +1,10 @@
+services:
+  bot:
+    build: .
+    container_name: discord-music-bot
+    restart: unless-stopped
+    environment:
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
+      - FFMPEG_PATH=/usr/bin/ffmpeg
+    volumes:
+      - .:/app
