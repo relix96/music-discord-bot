@@ -145,8 +145,18 @@ async def ensure_voice(ctx: commands.Context) -> discord.VoiceClient:
             return ctx.voice_client
         raise commands.CommandError(f"Erro ao conectar: {error_msg}")
     except (discord.errors.ConnectionClosed, discord.ConnectionClosed) as e:
+        code = getattr(e, "code", None)
+        if code == 4006:
+            raise commands.CommandError(
+                "🔌 **Sessão de voz inválida (4006)** — O Discord fechou a sessão.\n\n"
+                "**O que fazer:**\n"
+                "1. Usa `!leave` se o bot ainda aparecer no canal e tenta `!play` de novo\n"
+                "2. Espera 10–20 segundos e tenta outra vez\n"
+                "3. Confirma que o PyNaCl está instalado: `pip install PyNaCl`\n"
+                "4. Reinicia o bot (sessões antigas podem ficar inválidas)"
+            )
         raise commands.CommandError(
-            f"Conexão fechada pelo Discord: {e}\n"
+            f"Conexão fechada pelo Discord (código {code or '?'}): {e}\n"
             "Isto pode ser um problema temporário. Tenta novamente em alguns segundos."
         )
     except Exception as e:
@@ -447,29 +457,52 @@ async def play(ctx: commands.Context, *, query: str = ""):
         state.audio_task = bot.loop.create_task(player_loop(ctx.guild))
 
     # Verifica se há anexos (ficheiros) na mensagem
+    SUPPORTED_AUDIO_EXT = ('.mp3', '.m4a', '.wav', '.flac', '.ogg', '.opus', '.aac')
     if ctx.message.attachments:
-        attachment = ctx.message.attachments[0]
-        
-        # Verifica se é um ficheiro de áudio
-        ext = os.path.splitext(attachment.filename)[1].lower() if attachment.filename else ""
-        if ext not in ['.mp3', '.m4a', '.wav', '.flac', '.ogg', '.opus', '.aac']:
-            raise commands.CommandError(f"Formato de ficheiro não suportado: {ext}. Formatos suportados: MP3, M4A, WAV, FLAC, OGG, OPUS, AAC")
-        
-        # Descarrega o anexo para um ficheiro temporário
-        temp_path = os.path.join(tempfile.gettempdir(), f"discord_bot_{uuid.uuid4().hex}{ext}")
-        try:
-            await attachment.save(temp_path)
-        except Exception as e:
-            raise commands.CommandError(f"Erro ao descarregar o ficheiro: {e}")
-        
-        # Cria info para o ficheiro descarregado
-        info = {
-            "title": attachment.filename or "Ficheiro anexado",
-            "webpage_url": None,
-            "url": None,
-            "file_path": temp_path,
-            "duration": None,
-        }
+        infos: list[dict] = []
+        for attachment in ctx.message.attachments:
+            ext = os.path.splitext(attachment.filename)[1].lower() if attachment.filename else ""
+            if ext not in SUPPORTED_AUDIO_EXT:
+                continue  # skip unsupported attachments
+            temp_path = os.path.join(tempfile.gettempdir(), f"discord_bot_{uuid.uuid4().hex}{ext}")
+            try:
+                await attachment.save(temp_path)
+            except Exception as e:
+                raise commands.CommandError(f"Erro ao descarregar o ficheiro {attachment.filename}: {e}")
+            infos.append({
+                "title": attachment.filename or "Ficheiro anexado",
+                "webpage_url": None,
+                "url": None,
+                "file_path": temp_path,
+                "duration": None,
+            })
+        if not infos:
+            raise commands.CommandError(
+                f"Nenhum ficheiro de áudio nos anexos. Formatos suportados: MP3, M4A, WAV, FLAC, OGG, OPUS, AAC"
+            )
+        # Add all to queue; we'll use the first as "info" for the legacy single-item path, then add the rest
+        info = infos[0]
+        for i in infos:
+            await state.queue.put(i)
+            state.queue_list.append(i)
+        # Build reply and skip the single put/append below
+        queue_display = state.get_queue_display()
+        total_items = len(queue_display)
+        if len(infos) == 1:
+            msg = f"✅ Adicionado à fila: **{info['title']}**"
+        else:
+            msg = f"✅ Adicionados **{len(infos)}** ficheiros à fila:\n"
+            for idx, it in enumerate(infos, 1):
+                msg += f"  {idx}. {it['title']}\n"
+        msg += f"\n📋 **Fila ({total_items} {'item' if total_items == 1 else 'itens'}):**"
+        for idx, queue_item in enumerate(queue_display, 1):
+            prefix = "▶️" if idx == 1 and state.currently_playing == queue_item else f"{idx}."
+            title = queue_item.get('title', 'Sem título')
+            msg += f"\n{prefix} {title}"
+        await ctx.reply(msg)
+        if voice and not voice.is_playing() and not voice.is_paused():
+            pass
+        return
     elif query.strip():
         # Verifica se é um ficheiro local primeiro
         if is_local_file(query):
