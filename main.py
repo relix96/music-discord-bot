@@ -755,3 +755,4 @@ if __name__ == "__main__":
     if not TOKEN:
         raise RuntimeError("Define a variável de ambiente DISCORD_BOT_TOKEN com o token do teu bot.")
     bot.run(TOKEN)
+
