@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import time
 import uuid
+import platform
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -87,6 +88,7 @@ class GuildMusicState:
         self.current_ytdl_process: Optional[subprocess.Popen[bytes]] = None
         self.last_activity_at: float = 0.0  # For inactivity auto-leave
         self.last_channel_id: Optional[int] = None  # To send auto-leave message
+        self.voice_connect_lock = asyncio.Lock()  # Avoid concurrent connect/move races
     
     def get_queue_display(self) -> list[dict]:
         """Retorna a lista completa da fila (incluindo o que está a tocar)."""
@@ -153,67 +155,99 @@ async def ensure_voice(ctx: commands.Context) -> discord.VoiceClient:
     if not ctx.author.voice or not ctx.author.voice.channel:
         raise commands.CommandError("Tens de estar num canal de voz para eu entrar.")
 
-    voice = ctx.voice_client
-    if voice and voice.is_connected():
-        # Se já está ligado mas noutro canal, move
-        if voice.channel != ctx.author.voice.channel:
-            try:
-                await voice.move_to(ctx.author.voice.channel)
-            except Exception as e:
-                raise commands.CommandError(f"Erro ao mover para o canal: {e}")
-        return voice
+    state = get_state(ctx.guild.id)
+    target_channel = ctx.author.voice.channel
 
-    # Tenta conectar - aumenta o timeout e remove o wrapper duplo
-    try:
-        # Usa timeout maior (60s é o padrão do Discord.py, mas alguns casos precisam mais)
-        voice_client = await ctx.author.voice.channel.connect(timeout=60.0, reconnect=True)
-        # Espera um pouco para garantir que a conexão está estável
-        await asyncio.sleep(1.0)
-        
-        # Verifica se realmente está conectado
-        if not voice_client.is_connected():
-            await voice_client.disconnect(force=True)
-            raise commands.CommandError("Conexão estabelecida mas não está ativa. Tenta novamente.")
-        
-        return voice_client
-    except asyncio.TimeoutError:
-        raise commands.CommandError(
-            "⏱️ Timeout ao conectar ao canal de voz.\n\n"
-            "**Possíveis soluções:**\n"
-            "1. Verifica se o bot tem permissões 'Connect' e 'Speak' no canal\n"
-            "2. Verifica se há firewall bloqueando conexões UDP\n"
-            "3. Tenta reiniciar o bot\n"
-            "4. Verifica se o PyNaCl está instalado: `pip install PyNaCl`"
-        )
-    except discord.ClientException as e:
-        error_msg = str(e)
-        if "Already connected" in error_msg:
-            # Já está conectado, retorna o voice client existente
-            return ctx.voice_client
-        raise commands.CommandError(f"Erro ao conectar: {error_msg}")
-    except (discord.errors.ConnectionClosed, discord.ConnectionClosed) as e:
-        code = getattr(e, "code", None)
-        if code == 4006:
+    async with state.voice_connect_lock:
+        voice = ctx.guild.voice_client
+        if voice and voice.is_connected():
+            # Se já está ligado mas noutro canal, move
+            if voice.channel != target_channel:
+                try:
+                    await voice.move_to(target_channel)
+                except Exception as e:
+                    raise commands.CommandError(f"Erro ao mover para o canal: {e}")
+            return voice
+
+        # Tenta limpar ligação "presa" antes de novo connect
+        if voice:
+            try:
+                await voice.disconnect(force=True)
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+
+        last_error: Optional[Exception] = None
+        for attempt in range(1, 4):
+            try:
+                # Keep retries under our control; discord.py internal reconnect can loop on stale sessions.
+                voice_client = await target_channel.connect(
+                    timeout=45.0,
+                    reconnect=False,
+                    self_deaf=True,
+                )
+                if voice_client and voice_client.is_connected():
+                    return voice_client
+                try:
+                    if voice_client:
+                        await voice_client.disconnect(force=True)
+                except Exception:
+                    pass
+                last_error = commands.CommandError("Conexão estabelecida mas não está ativa.")
+            except asyncio.TimeoutError as e:
+                last_error = e
+            except discord.ClientException as e:
+                error_msg = str(e)
+                if "Already connected" in error_msg and ctx.guild.voice_client:
+                    vc = ctx.guild.voice_client
+                    if vc.is_connected():
+                        return vc
+                    try:
+                        await vc.disconnect(force=True)
+                    except Exception:
+                        pass
+                last_error = e
+            except (discord.errors.ConnectionClosed, discord.ConnectionClosed) as e:
+                last_error = e
+            except Exception as e:
+                last_error = e
+
+            # Reset entre tentativas para evitar estado de handshake antigo (ex: 4017)
+            vc = ctx.guild.voice_client
+            if vc:
+                try:
+                    await vc.disconnect(force=True)
+                except Exception:
+                    pass
+            await asyncio.sleep(min(2.0 * attempt, 6.0))
+
+        if isinstance(last_error, asyncio.TimeoutError):
             raise commands.CommandError(
-                "🔌 **Sessão de voz inválida (4006)** — O Discord fechou a sessão.\n\n"
-                "**O que fazer:**\n"
-                "1. Usa `!leave` se o bot ainda aparecer no canal e tenta `!play` de novo\n"
-                "2. Espera 10–20 segundos e tenta outra vez\n"
-                "3. Confirma que o PyNaCl está instalado: `pip install PyNaCl`\n"
-                "4. Reinicia o bot (sessões antigas podem ficar inválidas)"
+                "⏱️ Timeout ao conectar ao canal de voz.\n\n"
+                "Possíveis soluções:\n"
+                "1. Verifica permissões Connect/Speak\n"
+                "2. Verifica firewall/UDP\n"
+                "3. Reinicia o bot\n"
+                "4. Confirma dependências de voz: `pip install PyNaCl davey`"
             )
+
+        if isinstance(last_error, (discord.errors.ConnectionClosed, discord.ConnectionClosed)):
+            code = getattr(last_error, "code", None)
+            if code in (4006, 4017):
+                raise commands.CommandError(
+                    f"Sessão de voz inválida ({code}). Tenta `!leave` e depois `!play` novamente em 10-20s."
+                )
+            raise commands.CommandError(
+                f"Conexão de voz fechada pelo Discord (código {code or '?'}). Tenta novamente em alguns segundos."
+            )
+
+        if isinstance(last_error, discord.ClientException):
+            raise commands.CommandError(f"Erro ao conectar: {last_error}")
+
+        error_type = type(last_error).__name__ if last_error else "UnknownError"
         raise commands.CommandError(
-            f"Conexão fechada pelo Discord (código {code or '?'}): {e}\n"
-            "Isto pode ser um problema temporário. Tenta novamente em alguns segundos."
-        )
-    except Exception as e:
-        error_type = type(e).__name__
-        raise commands.CommandError(
-            f"Erro inesperado ao conectar ({error_type}): {e}\n\n"
-            "Verifica:\n"
-            "- Se o PyNaCl está instalado: `pip install PyNaCl`\n"
-            "- Se há problemas de rede/firewall\n"
-            "- Se o bot tem as permissões necessárias"
+            f"Erro inesperado ao conectar ({error_type}): {last_error}\n"
+            "Verifica dependências de voz (PyNaCl/davey), permissões do bot e conectividade de rede."
         )
 
 
@@ -463,10 +497,12 @@ async def on_ready():
 @bot.command(name="join")
 async def join(ctx: commands.Context):
     touch_activity(ctx.guild.id, ctx.channel.id)
-    if not _is_pynacl_available():
+    missing_voice_libs = _missing_voice_libraries()
+    if missing_voice_libs:
+        pip_pkgs = " ".join("PyNaCl" if lib == "PyNaCl" else "davey" for lib in missing_voice_libs)
         return await ctx.reply(
-            "⚠️ PyNaCl não está instalado. É necessário para conexões de voz.\n"
-            "Instala com: `pip install PyNaCl`"
+            f"⚠️ Dependências de voz em falta: {', '.join(missing_voice_libs)}.\n"
+            f"Instala com: `pip install {pip_pkgs}`"
         )
     try:
         await ensure_voice(ctx)
@@ -492,10 +528,12 @@ async def play(ctx: commands.Context, *, query: str = ""):
             "2. Adiciona a pasta **bin** ao PATH do sistema,\n"
             "   ou no `.env` define: `FFMPEG_PATH=C:\\caminho\\para\\ffmpeg.exe`"
         )
-    if not _is_pynacl_available():
+    missing_voice_libs = _missing_voice_libraries()
+    if missing_voice_libs:
+        pip_pkgs = " ".join("PyNaCl" if lib == "PyNaCl" else "davey" for lib in missing_voice_libs)
         return await ctx.reply(
-            "⚠️ PyNaCl não está instalado. É necessário para conexões de voz.\n"
-            "Instala com: `pip install PyNaCl`"
+            f"⚠️ Dependências de voz em falta: {', '.join(missing_voice_libs)}.\n"
+            f"Instala com: `pip install {pip_pkgs}`"
         )
     try:
         voice = await ensure_voice(ctx)
@@ -694,9 +732,19 @@ async def voiceinfo(ctx: commands.Context):
     """Comando de diagnóstico para verificar o estado da conexão de voz."""
     info_lines = []
     
-    # Verifica PyNaCl
+    # Verifica bibliotecas de voz
     pynacl_ok = _is_pynacl_available()
+    davey_ok = _is_davey_available()
     info_lines.append(f"PyNaCl: {'✅ Instalado' if pynacl_ok else '❌ Não instalado'}")
+    info_lines.append(f"davey: {'✅ Instalado' if davey_ok else '❌ Não instalado'}")
+    
+    # Runtime (útil para problemas de voz)
+    info_lines.append(f"Python: {sys.version.split()[0]} ({platform.architecture()[0]})")
+    info_lines.append(f"discord.py: {discord.__version__}")
+    if sys.version_info >= (3, 14):
+        info_lines.append("⚠️ Python 3.14+ pode ter incompatibilidades com stack de voz.")
+    if platform.architecture()[0] == "32bit":
+        info_lines.append("⚠️ Runtime 32-bit pode causar instabilidade em voz; preferir 64-bit.")
     
     # Verifica FFmpeg
     ffmpeg_ok = _is_ffmpeg_available()
@@ -751,8 +799,51 @@ def _is_pynacl_available() -> bool:
         return False
 
 
+def _is_davey_available() -> bool:
+    """True se o davey estiver instalado (necessário para voz em discord.py 2.7+)."""
+    try:
+        import davey
+        return True
+    except ImportError:
+        return False
+
+
+def _missing_voice_libraries() -> list[str]:
+    """Lista bibliotecas de voz em falta."""
+    missing: list[str] = []
+    if not _is_pynacl_available():
+        missing.append("PyNaCl")
+    if not _is_davey_available():
+        missing.append("davey")
+    return missing
+
+
+def _validate_runtime_for_voice() -> None:
+    """
+    Valida runtime para estabilidade de voz no Discord.
+    Nota: Python 3.14 e builds 32-bit têm mostrado falhas de handshake (ex: close code 4017).
+    """
+    py_ver = sys.version_info
+    arch = platform.architecture()[0]
+    if py_ver >= (3, 14) or arch == "32bit":
+        msg = (
+            "Runtime incompatível para voz do Discord.\n"
+            f"- Python atual: {py_ver.major}.{py_ver.minor}.{py_ver.micro}\n"
+            f"- Arquitetura: {arch}\n\n"
+            "Recomendado:\n"
+            "1. Instalar Python 3.12 ou 3.13 (64-bit)\n"
+            "2. Recriar a venv\n"
+            "3. Reinstalar dependências: pip install -r requirements.txt\n"
+        )
+        strict_runtime = os.getenv("STRICT_VOICE_RUNTIME", "").strip() == "1"
+        if strict_runtime:
+            raise RuntimeError(msg)
+        print("[WARN] " + msg.replace("\n", " "))
+
+
 if __name__ == "__main__":
     if not TOKEN:
         raise RuntimeError("Define a variável de ambiente DISCORD_BOT_TOKEN com o token do teu bot.")
+    _validate_runtime_for_voice()
     bot.run(TOKEN)
 
